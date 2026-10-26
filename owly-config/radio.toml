@@ -1,4 +1,9 @@
-# MT7921 (mt7921e) : marquée "untested" par Owly, mode active-monitor, canal 6.
+# MT7921 (mt7921e) : marquée "untested" par Owly, d'où allow_untested.
 station = "wlp3s0"
 allow_untested = true
 country = "FR"
+# L'envoi est limité par le nombre de trames que l'iPhone laisse passer dans
+# ses créneaux : plusieurs paquets par trame (A-MSDU), au débit non-HT le plus
+# haut. Pas de « mcs » : le patch mt76 n'applique que les débits non-HT.
+tx_rate = "54"
+tx_amsdu = true

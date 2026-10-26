@@ -140,8 +140,11 @@ jusqu'à « Envoyé ».
 
 ## Limites connues et suite
 
-- Pas encore de choix automatique du mode partagé (Wi-Fi gardé) quand le
-  réseau est sur 6, 44 ou 149.
+- Le Wi-Fi coupe le temps du transfert, puis revient. Basculer seul en mode
+  partagé (Wi-Fi gardé) sur un réseau en 6, 44 ou 149 n'est pas prévu : Owly
+  ne lit son mode qu'au démarrage d'owlyd (il faudrait un assistant root), et
+  ce mode n'est pas validé sur MT7921. Possible, si un jour la coupure gêne,
+  après un test manuel sur un réseau compatible.
 - Envoi lent (~100 Ko/s) quand l'iPhone est sur un Wi-Fi 2,4 GHz : voir
   l'[issue #1](https://github.com/fredericguiose/airdrop-gnome/issues/1).
 - `airdrop/discover.py` refait le `POST /Discover` d'owly-airdrop ; à retirer

@@ -75,12 +75,28 @@ sudo dnf install nautilus-python
 Puis se déconnecter et se reconnecter (sous Wayland, GNOME ne charge une
 nouvelle extension qu'à l'ouverture de session).
 
+### 4. Extension Chrome (facultatif)
+
+Clic droit sur une page ou un lien → **« Envoyer via AirDrop »**, ou le bouton
+de la barre d'outils : la page s'ouvre sur l'iPhone.
+
+```sh
+chrome/install.sh
+```
+
+puis dans `chrome://extensions` : **Mode développeur** → **Charger l'extension
+non empaquetée** → dossier `chrome/extension`. Le script déclare le relais
+local (*native messaging*) à Chrome, Chromium, Brave, Edge et Vivaldi s'ils
+sont installés ; il n'accepte que cette extension (identifiant fixé par la clé
+du manifeste) et ne transmet à `airdrop-send --url` que des adresses http(s).
+Le Chrome en Flatpak ne permet pas ce relais.
+
 ## Comment ça marche
 
 ```
- bouton GNOME Shell ─┐                       ┌─ owly receive / browse / send
- fenêtre d'envoi ────┼─ D-Bus (session) ─ airdropd ─┤
- (extension Chrome) ─┘   fr.portalstudio.AirDrop     └─ owlyd (D-Bus système) : la radio
+ bouton GNOME Shell ──┐                                ┌─ owly receive / browse / send
+ fenêtre d'envoi ─────┼── D-Bus (session) ── airdropd ─┤
+ extension Chrome ────┘   fr.portalstudio.AirDrop      └─ owlyd (D-Bus système) : la radio
 ```
 
 Tout passe par **`airdropd`**, un petit service de session lancé par D-Bus au
@@ -97,6 +113,7 @@ utilisateur et redescend avec le dernier ; owlyd la reprend si le service meurt.
 | `extension/` | Extension GNOME Shell 50 : le bouton et les notifications, simple client D-Bus (aucun processus dans le Shell) |
 | `send/airdrop-send` | Fenêtre d'envoi (Python, GTK 4, libadwaita), cliente du service |
 | `nautilus/` | Entrée « Envoyer via AirDrop » du clic droit (nautilus-python) |
+| `chrome/` | Extension Chrome (menu et bouton) et son relais local, qui lance `airdrop-send --url` |
 | `driver/` | Le patch mt76 et son installation DKMS |
 | `owly-config/` | Installation et configuration d'Owly |
 

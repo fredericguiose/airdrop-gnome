@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Relais « native messaging » de l'extension Chrome : un message
+{"url": "https://…"} → `airdrop-send --url …`, détaché, puis {"ok": true}.
+
+Chrome lance ce programme pour un seul message et le tue ensuite : la fenêtre
+d'envoi part dans sa propre session pour lui survivre.
+"""
+
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+from urllib.parse import urlsplit
+
+MAX_URL = 8192
+
+
+def read_message():
+    raw = sys.stdin.buffer.read(4)
+    if len(raw) < 4:
+        return None
+    (length,) = struct.unpack("=I", raw)
+    if length > 1 << 20:
+        raise ValueError("message trop long")
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_message(obj):
+    data = json.dumps(obj).encode()
+    sys.stdout.buffer.write(struct.pack("=I", len(data)) + data)
+    sys.stdout.buffer.flush()
+
+
+def check_url(url):
+    # Ce qui vient d'une page web est une donnée, jamais une commande : on ne
+    # passe à airdrop-send qu'une adresse http(s) bien formée, en argument.
+    if not isinstance(url, str) or len(url) > MAX_URL or any(c in url for c in "\r\n\0"):
+        raise ValueError("adresse invalide")
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError("seules les adresses http(s) peuvent être envoyées")
+    return url
+
+
+def main():
+    try:
+        message = read_message()
+        if message is None:
+            return
+        url = check_url(message.get("url"))
+        exe = shutil.which("airdrop-send") or os.path.expanduser("~/.local/bin/airdrop-send")
+        subprocess.Popen([exe, "--url", url], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        write_message({"ok": True})
+    except Exception as e:  # noqa: BLE001 : toujours répondre à Chrome
+        write_message({"ok": False, "error": str(e)})
+
+
+if __name__ == "__main__":
+    main()

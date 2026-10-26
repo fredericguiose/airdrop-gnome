@@ -1,0 +1,4 @@
+# MT7921 (mt7921e) : marquée "untested" par Owly, mode active-monitor, canal 6.
+station = "wlp3s0"
+allow_untested = true
+country = "FR"

@@ -1,0 +1,8 @@
+{
+  "uuid": "airdrop@portalstudio.fr",
+  "name": "AirDrop",
+  "description": "Recevoir des fichiers d'un iPhone par AirDrop, via Owly.",
+  "shell-version": ["50"],
+  "url": "https://github.com/t4t5/owly",
+  "version": 1
+}

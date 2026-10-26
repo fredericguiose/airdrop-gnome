@@ -1,0 +1,6 @@
+#!/bin/sh
+# kernel-install : prépare le pilote AirDrop pour chaque nouveau noyau.
+# Un échec ne bloque jamais la mise à jour (pilote d'origine conservé).
+[ "$1" = add ] || exit 0
+/usr/local/sbin/mt7921e-airdrop-build "$2" >/dev/null 2>&1 || true
+exit 0

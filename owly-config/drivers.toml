@@ -1,0 +1,11 @@
+# Surcharge locale de la table des pilotes d'Owly, lue par-dessus celle du paquet.
+# Le mt7921e est patché (DKMS mt7921e-airdrop, débit des trames injectées) :
+# il émet en 5 GHz, donc 44 et 149 avant 6, où l'iPhone passe bien plus de temps.
+# Pour le mode partagé (Wi-Fi gardé), le réseau doit être sur 6, 44 ou 149 :
+# mettre mode = "shared" et reconnect_after_monitor = true.
+[drivers.mt7921e]
+status = "untested"
+mode = "active-monitor"
+channels = [44, 149, 6]
+mt76_pm_off = true
+notes = "MT7921 14c3:7961 avec le patch shaecodes-wilde/mt76 2a2f085d."

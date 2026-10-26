@@ -1,0 +1,14 @@
+# Rattrapage au démarrage : si kernel-devel est arrivé après le noyau pendant
+# la mise à jour, le hook n'a rien pu construire ; on le fait ici.
+[Unit]
+Description=Pilote mt7921e patché pour AirDrop (Owly), noyau courant
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mt7921e-airdrop-build
+SuccessExitStatus=1
+
+[Install]
+WantedBy=multi-user.target

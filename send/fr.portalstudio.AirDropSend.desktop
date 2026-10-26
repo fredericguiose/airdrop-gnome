@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=AirDrop
+Comment=Envoyer des fichiers à un iPhone ou un Mac
+Exec=airdrop-send %F
+Icon=network-wireless-hotspot-symbolic
+Terminal=false
+Categories=Network;FileTransfer;
+StartupNotify=true
+NoDisplay=false

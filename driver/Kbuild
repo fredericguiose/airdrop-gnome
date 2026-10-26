@@ -1,0 +1,3 @@
+# Seulement mt7921e : mt76, mt792x-lib et mt7921-common restent ceux du noyau.
+obj-m := mt7921e.o
+mt7921e-y := pci.o pci_mac.o pci_mcu.o

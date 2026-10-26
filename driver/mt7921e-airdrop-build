@@ -1,0 +1,76 @@
+#!/bin/bash
+# Construit et installe (DKMS) le pilote mt7921e patché pour AirDrop (Owly),
+# pour un noyau donné (par défaut celui qui tourne).
+#
+# Patch : shaecodes-wilde/mt76 02b6c9a1 + 2a2f085d (débit des trames injectées,
+# https://github.com/t4t5/owly/issues/14). Les sources mt76 viennent du noyau
+# stable correspondant (gregkh/linux, tag vX.Y.Z), donc l'ABI colle au noyau.
+#
+# Sans danger si ça échoue : le pilote d'origine reste en place et AirDrop
+# repasse en mode exclusif. Si le patch est déjà dans le noyau, ne fait rien.
+set -euo pipefail
+
+NAME=mt7921e-airdrop
+SHARE=/usr/share/mt7921e-airdrop
+KVER="${1:-$(uname -r)}"
+UPSTREAM="${KVER%%-*}"   # 7.2.11-200.fc44.x86_64 -> 7.2.11
+SRC="/usr/src/$NAME-$UPSTREAM"
+MT76=drivers/net/wireless/mediatek/mt76
+RAW="https://raw.githubusercontent.com/gregkh/linux/v$UPSTREAM/$MT76"
+
+log() { echo "$NAME: $*"; logger -t "$NAME" -- "$*" 2>/dev/null || true; }
+
+if [ ! -d "/lib/modules/$KVER/build" ]; then
+  log "pas de kernel-devel pour $KVER, rien à faire (pilote d'origine conservé)"
+  exit 0
+fi
+
+if dkms status -m "$NAME" -v "$UPSTREAM" -k "$KVER" 2>/dev/null | grep -q installed; then
+  log "déjà installé pour $KVER"
+  exit 0
+fi
+
+if [ ! -d "$SRC" ]; then
+  TMP="$(mktemp -d)"
+  trap 'rm -rf "$TMP"' EXIT
+  mkdir -p "$TMP/mt7921"
+  while read -r f; do
+    curl -sfL --retry 3 -o "$TMP/$f" "$RAW/$f" || { log "téléchargement de $f (v$UPSTREAM) impossible"; exit 1; }
+  done < "$SHARE/files.txt"
+
+  # Déjà fusionné en amont ? Alors le noyau officiel suffit.
+  if (cd "$TMP" && git apply --reverse --check "$SHARE"/patches/*.patch) 2>/dev/null; then
+    log "le patch est déjà dans le noyau $UPSTREAM : module DKMS inutile, voir la tâche Todoist"
+    exit 0
+  fi
+  for p in "$SHARE"/patches/*.patch; do
+    (cd "$TMP" && git apply "$p") || { log "le patch ne s'applique plus sur $UPSTREAM ($p), pilote d'origine conservé"; exit 1; }
+  done
+
+  cp "$SHARE/Kbuild" "$TMP/mt7921/Makefile"
+  # Verrouillé sur cette version : des sources 7.2.11 ne doivent jamais être
+  # compilées contre un autre noyau (structures mt76 différentes).
+  cat > "$TMP/dkms.conf" <<EOF
+PACKAGE_NAME="$NAME"
+PACKAGE_VERSION="$UPSTREAM"
+BUILT_MODULE_NAME[0]="mt7921e"
+BUILT_MODULE_LOCATION[0]="mt7921/"
+DEST_MODULE_LOCATION[0]="/updates/dkms"
+MAKE[0]="make -C \${kernel_source_dir} M=\${dkms_tree}/$NAME/$UPSTREAM/build/mt7921 modules"
+CLEAN="make -C \${kernel_source_dir} M=\${dkms_tree}/$NAME/$UPSTREAM/build/mt7921 clean"
+BUILD_EXCLUSIVE_KERNEL="^${UPSTREAM//./\\.}-"
+AUTOINSTALL="yes"
+EOF
+  install -d "$SRC"
+  cp -r "$TMP"/. "$SRC"/
+fi
+
+dkms add -m "$NAME" -v "$UPSTREAM" 2>/dev/null || true
+dkms build -m "$NAME" -v "$UPSTREAM" -k "$KVER"
+dkms install -m "$NAME" -v "$UPSTREAM" -k "$KVER"
+log "installé pour $KVER (actif au prochain chargement du pilote)"
+
+# Les versions dont plus aucun noyau installé n'a besoin.
+for v in $(dkms status -m "$NAME" 2>/dev/null | sed -n "s|^$NAME/\([^,:]*\).*|\1|p" | sort -u); do
+  ls -d /lib/modules/"$v"-* &>/dev/null || { dkms remove -m "$NAME" -v "$v" --all || true; rm -rf "/usr/src/$NAME-$v"; }
+done

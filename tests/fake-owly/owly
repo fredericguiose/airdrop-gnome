@@ -12,6 +12,18 @@ case "$1 $2" in
     echo '729b49d9adcc   "MacBook Pro de Test" ([fe80::8bb:ccff:fedd:eeff%23]:8770)'
     trap 'exit 0' INT
     while :; do sleep 0.2; done ;;
+  "receive --dir")
+    # Une demande d'iPhone, la question, puis le fichier si on répond y.
+    echo 'receiving as "test" (c0ffee) on [fe80::1]:8771, flags 0x89' >&2
+    sleep 1
+    printf '"iPhone de Camille" ("iPhone") wants to send:\n  "photo.jpg" public.jpeg 12 bytes\naccept? [y/N] ' >&2
+    trap 'exit 0' INT
+    if ! read -r -t 15 answer; then
+      echo >&2; echo "timed out" >&2
+    elif [ "$answer" = y ]; then
+      echo "photo reçue" > "$3/photo.jpg"; echo "$3/photo.jpg"
+    fi
+    while :; do sleep 0.2; done ;;
   "send --mac")
     echo "sending to \"x\" at [..]:8770" >&2; sleep 1; echo accepted >&2
     for i in 1 2 3 4 5; do printf '\r%d / 5000000 bytes' $((i * 1000000)) >&2; sleep 0.3; done

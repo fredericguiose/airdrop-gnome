@@ -9,6 +9,7 @@ avec son nom ; les autres ne répondent pas.
 """
 
 import json
+import os
 import plistlib
 import socket
 import ssl
@@ -20,22 +21,18 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
+if __package__ in (None, ""):  # lancé comme script : python3 airdrop/discover.py
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from airdrop.owly import link_local, owlyd_bus  # noqa: E402
+
 PORT = 8770
 IFACE = "awdl0"
 TIMEOUT = 6
 
 
-def link_local(mac):
-    """L'adresse EUI-64 modifiée d'un MAC, celle des pairs AWDL (NET-1)."""
-    m = [int(b, 16) for b in mac.split(":")]
-    m[0] ^= 0x02
-    groups = [m[0] << 8 | m[1], m[2] << 8 | 0xFF, 0xFE << 8 | m[3], m[4] << 8 | m[5]]
-    return "fe80::" + ":".join(f"{g:x}" for g in groups)
-
-
 def peers():
     """Les pairs AWDL qu'entend la radio, d'après owlyd."""
-    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+    bus = owlyd_bus()
     reply = bus.call_sync(
         "io.github.t4t5.Owly", "/io/github/t4t5/Owly",
         "org.freedesktop.DBus.Properties", "Get",

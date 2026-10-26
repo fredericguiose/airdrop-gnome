@@ -1,3 +1,6 @@
+// Le bouton AirDrop : une télécommande d'airdropd (D-Bus, session). Aucun
+// processus ici ; c'est le service qui parle à Owly et tient la radio.
+
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
@@ -8,28 +11,22 @@ import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
-import {ReceiveSession} from './owly.js';
-
 const ICON = 'network-wireless-hotspot-symbolic';
 const DURATIONS = [2, 5, 10];
 const DEFAULT_MINUTES = 5;
-// Owly refuse tout seul au bout de 15 s (ASK-2) : on prévient un peu avant.
-const ANSWER_SECONDS = 14;
-// Après un transfert, on rend le Wi-Fi : le temps qu'un éventuel second
-// fichier du même envoi arrive.
-const LINGER_SECONDS = 3;
 
-function formatSize(bytes) {
-    return bytes == null ? '' : GLib.format_size(bytes);
-}
+const BUS_NAME = 'fr.portalstudio.AirDrop';
+const PATH = '/fr/portalstudio/AirDrop';
+const IFACE = 'fr.portalstudio.AirDrop1';
 
-function describe(request) {
-    if (request.urls.length)
-        return request.urls.join('\n');
-    const total = request.files.reduce((n, f) => n + (f.size ?? 0), 0);
-    if (request.files.length === 1)
-        return `${request.files[0].name} (${formatSize(total)})`;
-    return `${request.files.length} fichiers (${formatSize(total)})`;
+function describe(files, urls) {
+    if (urls.length)
+        return urls.join('\n');
+    const total = files.reduce((n, f) => n + f.size, 0);
+    const size = GLib.format_size(total);
+    if (files.length === 1)
+        return `${files[0].name} (${size})`;
+    return `${files.length} fichiers (${size})`;
 }
 
 const AirDropToggle = GObject.registerClass(
@@ -41,7 +38,6 @@ class AirDropToggle extends QuickMenuToggle {
             iconName: ICON,
             toggleMode: false,
         });
-        this._indicator = indicator;
         this._minutes = DEFAULT_MINUTES;
 
         this.menu.setHeader(ICON, 'AirDrop', 'Recevoir depuis un iPhone ou un Mac');
@@ -59,12 +55,11 @@ class AirDropToggle extends QuickMenuToggle {
         this._syncDurations();
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        const note = new PopupMenu.PopupMenuItem(
+        this.menu.addMenuItem(new PopupMenu.PopupMenuItem(
             'Le Wi-Fi est coupé pendant la réception,\npuis rétabli après le transfert.',
-            {reactive: false});
-        this.menu.addMenuItem(note);
-        this.menu.addAction('Ouvrir Téléchargements', () =>
-            Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(indicator.downloadDir, null), null));
+            {reactive: false}));
+        this.menu.addAction('Envoyer des fichiers…', () => indicator.pickFiles());
+        this.menu.addAction('Ouvrir Téléchargements', () => indicator.openDownloads());
 
         this.connect('clicked', () => indicator.toggle(this._minutes));
     }
@@ -79,67 +74,153 @@ const AirDropIndicator = GObject.registerClass(
 class AirDropIndicator extends SystemIndicator {
     _init() {
         super._init();
-        this.downloadDir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) ??
-            GLib.get_home_dir();
-
         this._icon = this._addIndicator();
         this._icon.icon_name = ICON;
         this._icon.visible = false;
 
         this._toggle = new AirDropToggle(this);
         this.quickSettingsItems.push(this._toggle);
+
+        this._requests = new Map();  // id → notification
+        this._cancellable = new Gio.Cancellable();
+        // Pas d'auto-démarrage pour suivre l'état : airdropd ne démarre
+        // qu'au premier vrai appel (D-Bus l'active alors).
+        Gio.DBusProxy.new_for_bus(
+            Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_AUTO_START, null,
+            BUS_NAME, PATH, IFACE, this._cancellable, (_o, res) => {
+                try {
+                    this._proxy = Gio.DBusProxy.new_for_bus_finish(res);
+                } catch (e) {
+                    if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        console.error(`AirDrop: ${e.message}`);
+                    return;
+                }
+                this._proxy.connect('g-signal', (_p, _sender, name, params) =>
+                    this._onSignal(name, params.deepUnpack()));
+                this._proxy.connect('g-properties-changed', () => this._sync());
+                this._proxy.connect('notify::g-name-owner', () => this._sync());
+                this._sync();
+            });
+    }
+
+    _prop(name, fallback) {
+        return this._proxy?.get_cached_property(name)?.unpack() ?? fallback;
+    }
+
+    _call(method, args = null) {
+        // Sans DO_NOT_AUTO_START sur l'appel : c'est lui qui lance airdropd.
+        Gio.DBus.session.call(BUS_NAME, PATH, IFACE, method, args, null,
+            Gio.DBusCallFlags.NONE, -1, null, (conn, res) => {
+                try {
+                    conn.call_finish(res);
+                } catch (e) {
+                    this._starting = false;
+                    this._notify('AirDrop indisponible', Gio.DBusError.strip_remote_error(e) || e.message);
+                    this._sync();
+                }
+            });
     }
 
     toggle(minutes) {
-        if (this._session)
-            this._session.stop();
-        else
-            this._start(minutes);
+        if (this._prop('ReceivingUntil', 0) > 0 || this._starting) {
+            this._starting = false;
+            this._call('StopReceiving');
+        } else {
+            this._starting = true;
+            this._call('StartReceiving', new GLib.Variant('(u)', [minutes * 60]));
+        }
+        this._sync();
     }
 
-    _start(minutes) {
-        this._deadline = GLib.get_monotonic_time() + minutes * 60 * 1e6;
-        this._session = new ReceiveSession({dir: this.downloadDir, seconds: minutes * 60}, {
-            state: s => this._onState(s),
-            request: r => this._onRequest(r),
-            expired: () => this._closeRequest('Demande expirée', 'Personne n\'a répondu à temps.'),
-            withdrawn: () => this._closeRequest('Envoi annulé', 'L\'appareil a annulé l\'envoi.'),
-            received: path => this._onReceived(path),
-            url: url => this._onUrl(url),
-            failed: reason => this._notify('Échec AirDrop', reason),
-        });
-        this._session.start();
+    pickFiles() {
+        Main.panel.statusArea.quickSettings.menu.close();
+        this._spawn(['airdrop-send']);
     }
 
-    _onState(state) {
+    openDownloads() {
+        const dir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) ?? GLib.get_home_dir();
+        Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(dir, null), null);
+    }
+
+    _spawn(argv) {
+        try {
+            Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
+        } catch (e) {
+            this._notify('AirDrop', `${argv[0]} introuvable : ${e.message}`);
+        }
+    }
+
+    _sync() {
+        const until = this._prop('ReceivingUntil', 0);
+        const radio = this._prop('Radio', 'idle');
+        const on = until > 0;
+        if (on)
+            this._starting = false;
         const t = this._toggle;
-        if (state === 'starting') {
-            t.checked = true;
-            t.subtitle = 'Démarrage…';
-            this._icon.visible = true;
-        } else if (state === 'receiving') {
+        t.checked = on || this._starting;
+        this._icon.visible = t.checked;
+
+        if (on && radio === 'up') {
             this._tick();
-            this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => this._tick());
-        } else if (state === 'stopped') {
-            this._session = null;
-            this._clearTimers();
-            this._dismissRequest();
-            t.checked = false;
-            t.subtitle = 'Désactivé';
-            this._icon.visible = false;
+            this._timer ||= GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => this._tick());
+        } else {
+            this._clearTimer();
+            t.subtitle = t.checked ? 'Démarrage…' : 'Désactivé';
         }
     }
 
     _tick() {
-        const left = Math.max(0, Math.round((this._deadline - GLib.get_monotonic_time()) / 1e6));
+        const until = this._prop('ReceivingUntil', 0);
+        const left = Math.max(0, Math.round((until - GLib.get_real_time()) / 1e6));
         const mm = Math.floor(left / 60), ss = String(left % 60).padStart(2, '0');
         this._toggle.subtitle = `Visible · ${mm}:${ss}`;
         return GLib.SOURCE_CONTINUE;
     }
 
-    _onRequest(request) {
-        this._dismissRequest();
-        const n = this._notify(`${request.sender} veut vous envoyer`, describe(request), {
+    _clearTimer() {
+        if (this._timer)
+            GLib.source_remove(this._timer);
+        this._timer = 0;
+    }
+
+    _onSignal(name, args) {
+        switch (name) {
+        case 'Request': {
+            const [id, sender, files, urls] = args;
+            this._onRequest(id, sender, files.map(f => ({name: f.name, size: Number(f.size)})), urls);
+            break;
+        }
+        case 'RequestClosed': {
+            const [id, reason] = args;
+            this._dismiss(id);
+            if (reason === 'expired')
+                this._notify('Demande expirée', 'Personne n\'a répondu à temps.');
+            else if (reason === 'withdrawn')
+                this._notify('Envoi annulé', 'L\'appareil a annulé l\'envoi.');
+            break;
+        }
+        case 'Received':
+            this._onReceived(args[0]);
+            break;
+        case 'UrlReceived':
+            this._onUrl(args[0]);
+            break;
+        case 'ReceiveFailed':
+            this._notify('Échec de la réception', args[0]);
+            break;
+        case 'RadioFailed':
+            // Peut venir d'un autre client (la fenêtre d'envoi) : ne parler
+            // que si c'est la réception qui démarrait.
+            if (this._starting || this._prop('ReceivingUntil', 0) > 0)
+                this._notify('Impossible de démarrer AirDrop', args[0]);
+            this._starting = false;
+            this._sync();
+            break;
+        }
+    }
+
+    _onRequest(id, sender, files, urls) {
+        const n = this._notify(`${sender} veut vous envoyer`, describe(files, urls), {
             urgency: MessageTray.Urgency.CRITICAL,
             resident: true,
         });
@@ -148,35 +229,28 @@ class AirDropIndicator extends SystemIndicator {
             if (answered)
                 return;
             answered = true;
-            request.answer(yes);
-            this._dismissRequest();
-            if (yes)
-                this._toggle.subtitle = 'Réception…';
+            this._requests.delete(id);
+            // Déjà réglée côté service, ou extension en train de s'arrêter :
+            // ne rien renvoyer (et ne pas relancer airdropd pour rien).
+            if (!n._airdropClosed && !this._destroying)
+                this._call('Answer', new GLib.Variant('(sb)', [id, yes]));
+            n.destroy();
         };
         n.addAction('Refuser', () => answer(false));
         n.addAction('Accepter', () => answer(true));
+        // Fermer la notification, c'est refuser.
         n.connect('destroy', () => answer(false));
-        this._request = n;
-        this._answerTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, ANSWER_SECONDS, () => {
-            this._answerTimer = 0;
-            answer(false);
-            return GLib.SOURCE_REMOVE;
-        });
+        this._requests.set(id, n);
     }
 
-    _closeRequest(title, body) {
-        this._dismissRequest();
-        this._notify(title, body);
-    }
-
-    _dismissRequest() {
-        if (this._answerTimer) {
-            GLib.source_remove(this._answerTimer);
-            this._answerTimer = 0;
+    _dismiss(id) {
+        const n = this._requests.get(id);
+        this._requests.delete(id);
+        if (n) {
+            // Déjà réglée côté service : ne pas répondre une seconde fois.
+            n._airdropClosed = true;
+            n.destroy();
         }
-        const n = this._request;
-        this._request = null;
-        n?.destroy();
     }
 
     _onReceived(path) {
@@ -184,7 +258,6 @@ class AirDropIndicator extends SystemIndicator {
         const n = this._notify('Fichier reçu', file.get_basename());
         n.addAction('Afficher', () => this._showInFolder(file));
         n.addAction('Ouvrir', () => Gio.AppInfo.launch_default_for_uri(file.get_uri(), null));
-        this._lingerThenStop();
     }
 
     _onUrl(url) {
@@ -192,7 +265,6 @@ class AirDropIndicator extends SystemIndicator {
         if (/^https?:\/\//i.test(url))
             Gio.AppInfo.launch_default_for_uri(url, null);
         this._notify('Lien reçu', url);
-        this._lingerThenStop();
     }
 
     _showInFolder(file) {
@@ -201,24 +273,6 @@ class AirDropIndicator extends SystemIndicator {
             'org.freedesktop.FileManager1', 'ShowItems',
             new GLib.Variant('(ass)', [[file.get_uri()], '']),
             null, Gio.DBusCallFlags.NONE, -1, null, null);
-    }
-
-    _lingerThenStop() {
-        if (this._lingerTimer)
-            GLib.source_remove(this._lingerTimer);
-        this._lingerTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, LINGER_SECONDS, () => {
-            this._lingerTimer = 0;
-            this._session?.stop();
-            return GLib.SOURCE_REMOVE;
-        });
-    }
-
-    _clearTimers() {
-        for (const id of ['_timer', '_lingerTimer']) {
-            if (this[id])
-                GLib.source_remove(this[id]);
-            this[id] = 0;
-        }
     }
 
     _notify(title, body, params = {}) {
@@ -235,9 +289,12 @@ class AirDropIndicator extends SystemIndicator {
     }
 
     destroy() {
-        this._session?.stop();
-        this._clearTimers();
-        this._dismissRequest();
+        this._destroying = true;
+        this._cancellable.cancel();
+        this._clearTimer();
+        for (const n of this._requests.values())
+            n.destroy();
+        this._requests.clear();
         this._source?.destroy();
         this.quickSettingsItems.forEach(i => i.destroy());
         super.destroy();

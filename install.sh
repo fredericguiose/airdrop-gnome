@@ -1,13 +1,21 @@
 #!/bin/bash
-# Installe la partie bureau, pour l'utilisateur courant (sans root) :
-# le bouton AirDrop de GNOME Shell, la fenêtre d'envoi et le clic droit de
-# Fichiers. Par liens symboliques : modifier le dépôt suffit.
+# Installe la partie bureau, pour l'utilisateur courant (sans root) : le
+# service airdropd, le bouton AirDrop de GNOME Shell, la fenêtre d'envoi et le
+# clic droit de Fichiers. Par liens symboliques : modifier le dépôt suffit.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 UUID=airdrop@portalstudio.fr
 
-mkdir -p ~/.local/bin ~/.local/share/applications \
+mkdir -p ~/.local/bin ~/.local/share/applications ~/.local/share/dbus-1/services \
   ~/.local/share/gnome-shell/extensions ~/.local/share/nautilus-python/extensions
+
+# airdropd, lancé par D-Bus au premier appel (il s'arrête seul, inoccupé).
+ln -sfn "$HERE/bin/airdropd" ~/.local/bin/airdropd
+sed "s|@BIN@|$HOME/.local/bin|" "$HERE/dbus/fr.portalstudio.AirDrop.service.in" \
+  > ~/.local/share/dbus-1/services/fr.portalstudio.AirDrop.service
+# Une version déjà lancée garderait l'ancien code : on la congédie.
+busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig >/dev/null 2>&1 || true
+pkill -f "$HOME/.local/bin/airdropd" 2>/dev/null || true
 
 ln -sfn "$HERE/send/airdrop-send" ~/.local/bin/airdrop-send
 ln -sfn "$HERE/send/fr.portalstudio.AirDropSend.desktop" ~/.local/share/applications/fr.portalstudio.AirDropSend.desktop

@@ -1,66 +1,33 @@
 #!/usr/bin/env python3
-"""Fenêtre d'envoi AirDrop (GTK 4 + libadwaita), par-dessus Owly.
+"""Fenêtre d'envoi AirDrop (GTK 4 + libadwaita), cliente d'airdropd.
 
     airdrop-send FICHIER...     envoyer des fichiers
     airdrop-send --url URL      envoyer un lien
+    airdrop-send                choisir des fichiers
 
-La radio n'est tenue que le temps de la fenêtre : `owly radio up --for` la
-rend de toute façon, et owlyd la reprend si ce processus disparaît.
+La radio, la recherche des appareils et l'envoi sont l'affaire d'airdropd
+(D-Bus, session) : la fenêtre ne fait que demander et afficher. Si elle
+disparaît, airdropd arrête de chercher pour elle de lui-même.
 """
 
-import ipaddress
-import json
 import os
-import re
-import signal
-import subprocess
 import sys
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
 
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-
-import gi  # noqa: E402
+import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-import discover  # noqa: E402
-
 APP_ID = "fr.portalstudio.AirDropSend"
-ICON = "network-wireless-hotspot-symbolic"
-# Plafond de la radio : au-delà, owly la rend même si la fenêtre est restée.
-RADIO_SECONDS = 300
-DISCOVER_EVERY = 3
-# Un appareil que la radio n'entend plus depuis ce délai sort de la liste.
-FORGET_SECONDS = 15
+BUS_NAME = "fr.portalstudio.AirDrop"
+PATH = "/fr/portalstudio/AirDrop"
+IFACE = "fr.portalstudio.AirDrop1"
 CLOSE_AFTER_SENT = 2
 
 
-def unquote(s):
-    """Une chaîne {:?} de Rust, telle qu'owly l'écrit."""
-    s = s.strip()
-    if not (s.startswith('"') and s.endswith('"')):
-        return s
-    s = re.sub(r"\\u\{([0-9a-fA-F]+)\}", lambda m: chr(int(m.group(1), 16)), s)
-    try:
-        return json.loads(s)
-    except ValueError:
-        return s[1:-1]
-
-
-def mac_from_link_local(addr):
-    """Le MAC d'une adresse EUI-64 modifiée (l'inverse de discover.link_local)."""
-    b = ipaddress.IPv6Address(addr).packed[8:]
-    if b[3:5] != b"\xff\xfe":
-        return None
-    return ":".join(f"{x:02x}" for x in (b[0] ^ 0x02, b[1], b[2], b[5], b[6], b[7]))
-
-
 def proximity(rssi):
-    if rssi is None:
+    if not rssi:
         return "À proximité"
     if rssi > -50:
         return "Très proche"
@@ -78,159 +45,91 @@ def summary(files, urls):
     return f"{len(files)} fichiers · {GLib.format_size(size)}"
 
 
-class Radio:
-    """`owly radio up` tant que la fenêtre vit, et l'écoute des appareils."""
+class AirDrop:
+    """Le bout d'airdropd dont la fenêtre a besoin."""
 
-    def __init__(self, on_up, on_failed, on_device):
-        self._on_up, self._on_failed, self._on_device = on_up, on_failed, on_device
-        self._procs = []
-        self._stop = threading.Event()
+    def __init__(self, on_radio, on_failed, on_device, on_lost):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        self._on = {"radio": on_radio, "failed": on_failed, "device": on_device, "lost": on_lost}
+        self._transfers = {}
+        self.bus.signal_subscribe(BUS_NAME, IFACE, None, PATH, None, Gio.DBusSignalFlags.NONE, self._signal)
+        self.bus.signal_subscribe(BUS_NAME, "org.freedesktop.DBus.Properties", "PropertiesChanged", PATH,
+                                  IFACE, Gio.DBusSignalFlags.MATCH_ARG0_NAMESPACE, self._props)
+
+    def _call(self, method, args=None, reply=None, on_reply=None):
+        def done(bus, res):
+            try:
+                result = bus.call_finish(res).unpack()
+            except GLib.Error as e:
+                self._on["failed"](Gio.DBusError.strip_remote_error(e) or e.message)
+                return
+            if on_reply:
+                on_reply(*result)
+        self.bus.call(BUS_NAME, PATH, IFACE, method, args, GLib.VariantType(reply) if reply else None,
+                      Gio.DBusCallFlags.NONE, 10_000, None, done)
 
     def start(self):
-        threading.Thread(target=self._run, daemon=True).start()
+        # Le premier appel lance airdropd (activation D-Bus).
+        self._call("StartBrowsing", on_reply=lambda: (self._read_radio(), self._read_devices()))
 
-    def _spawn(self, args, **kw):
-        kw.setdefault("text", True)
-        p = subprocess.Popen(args, **kw)
-        self._procs.append(p)
-        return p
+    def _read_radio(self):
+        self.bus.call(BUS_NAME, PATH, "org.freedesktop.DBus.Properties", "Get",
+                      GLib.Variant("(ss)", (IFACE, "Radio")), GLib.VariantType("(v)"),
+                      Gio.DBusCallFlags.NONE, -1, None,
+                      lambda bus, res: self._on["radio"](bus.call_finish(res).unpack()[0]))
 
-    def _run(self):
-        try:
-            radio = self._spawn(["owly", "radio", "up", "--for", str(RADIO_SECONDS)],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        except OSError as e:
-            GLib.idle_add(self._on_failed, f"owly introuvable : {e}")
-            return
-        last = ""
-        for line in radio.stdout:
-            if line.startswith("awdl0 is up"):
-                break
-            last = line.strip() or last
-        else:
-            if not self._stop.is_set():
-                GLib.idle_add(self._on_failed, last or "la radio AirDrop n'a pas démarré")
-            return
-        # Le reste de la sortie (la liste des pairs, chaque seconde) n'intéresse
-        # personne, mais il faut vider le tuyau.
-        threading.Thread(target=lambda: [None for _ in radio.stdout], daemon=True).start()
-        GLib.idle_add(self._on_up)
-        threading.Thread(target=self._browse, daemon=True).start()
-        self._discover_loop()
-
-    # `owly browse` réveille les iPhone en Bluetooth (BLE-1) et liste ceux
-    # qui s'annoncent en mDNS.
-    def _browse(self):
-        browse = self._spawn(["owly", "browse", "--seconds", str(RADIO_SECONDS)],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        pattern = re.compile(r'^\S+\s+(".*") \(\[([0-9a-fA-F:]+)%\d+\]:\d+\)$')
-        for line in browse.stdout:
-            m = pattern.match(line.strip())
-            mac = m and mac_from_link_local(m.group(2))
-            if mac:
-                GLib.idle_add(self._on_device, mac, {"name": unquote(m.group(1))})
-
-    # Les autres, comme un iPhone qui ne s'annonce pas : on leur demande
-    # leur nom (POST /Discover), sans rien envoyer.
-    def _discover_loop(self):
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            while not self._stop.wait(DISCOVER_EVERY):
-                try:
-                    peers = discover.peers()
-                except GLib.Error:
-                    continue
-                for peer, found in zip(peers, pool.map(self._ask, peers)):
-                    GLib.idle_add(self._on_device, peer["mac"], {"rssi": peer.get("rssi"), **found})
-
-    @staticmethod
-    def _ask(peer):
-        try:
-            return discover.discover(peer["mac"]) or {}
-        except Exception:  # noqa: BLE001 : un pair qui ne répond pas, c'est normal
-            return {}
+    def _read_devices(self):
+        self._call("GetDevices", reply="(aa{sv})", on_reply=lambda devices: [
+            self._on["device"](d["mac"], d) for d in devices])
 
     def send(self, mac, files, urls, on_event):
-        """Envoie dans un thread ; on_event(kind, *args) dans la boucle GTK."""
-        args = ["owly", "send", "--mac", mac]
-        args += [a for u in urls for a in ("--url", u)] or files
-        threading.Thread(target=self._send_guarded, args=(args, on_event), daemon=True).start()
+        def started(transfer):
+            self._transfers[transfer] = on_event
+        self._call("Send", GLib.Variant("(sasas)", (mac, files, urls)), "(s)", started)
 
-    # Quoi qu'il arrive, la fenêtre doit sortir de « En attente… ».
-    def _send_guarded(self, args, on_event):
-        try:
-            self._send(args, on_event)
-        except Exception as e:  # noqa: BLE001
-            GLib.idle_add(on_event, "failed", f"{type(e).__name__}: {e}")
-
-    def _send(self, args, on_event):
-        p = self._spawn(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, text=False)
-
-        def stderr():
-            # La progression se réécrit avec \r : on coupe sur \r et \n.
-            buf = b""
-            while chunk := p.stderr.read(256):
-                buf += chunk
-                *parts, buf = re.split(rb"[\r\n]", buf)
-                for part in parts:
-                    line = part.decode(errors="replace")
-                    if line == "accepted":
-                        GLib.idle_add(on_event, "accepted")
-                    elif m := re.match(r"^(\d+) / (\d+) bytes$", line):
-                        GLib.idle_add(on_event, "progress", int(m[1]), int(m[2]))
-                    elif line.startswith("owly: "):
-                        GLib.idle_add(on_event, "failed", line[6:])
-
-        t = threading.Thread(target=stderr, daemon=True)
-        t.start()
-        out = p.stdout.read().decode(errors="replace").strip()
-        p.wait()
-        t.join(timeout=1)
-        if out == "delivered":
-            GLib.idle_add(on_event, "delivered")
-        elif out == "declined":
-            GLib.idle_add(on_event, "declined")
-        elif out.startswith("failed: "):
-            GLib.idle_add(on_event, "failed", out[8:])
-        elif p.returncode != 0:
-            GLib.idle_add(on_event, "failed", out or f"owly send a quitté ({p.returncode})")
-
-    # Ctrl-C partout : owly rend la radio proprement.
     def stop(self):
-        self._stop.set()
-        for p in reversed(self._procs):
-            if p.poll() is None:
-                p.send_signal(signal.SIGINT)
-        deadline = time.monotonic() + 3
-        for p in self._procs:
-            try:
-                p.wait(timeout=max(0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                p.kill()
+        try:
+            self.bus.call_sync(BUS_NAME, PATH, IFACE, "StopBrowsing", None, None,
+                               Gio.DBusCallFlags.NO_AUTO_START, 2000, None)
+        except GLib.Error:
+            pass
+
+    def _props(self, _c, _s, _p, _i, _n, params):
+        _iface, changed, _ = params.unpack()
+        if "Radio" in changed:
+            self._on["radio"](changed["Radio"])
+
+    def _signal(self, _c, _s, _p, _i, name, params):
+        args = params.unpack()
+        if name == "DeviceSeen":
+            mac, dev_name, model, rssi = args
+            self._on["device"](mac, {"name": dev_name, "model": model, "rssi": rssi})
+        elif name == "DeviceLost":
+            self._on["lost"](args[0])
+        elif name == "RadioFailed":
+            self._on["failed"](args[0])
+        elif name == "SendProgress":
+            transfer, state, sent, total, detail = args
+            if on_event := self._transfers.get(transfer):
+                on_event(state, sent, total, detail)
 
 
 class DeviceRow(Adw.ActionRow):
     def __init__(self, mac, on_activate):
         super().__init__(activatable=True)
         self.mac = mac
-        self.name = None
-        self.rssi = None
-        self.seen = time.monotonic()
+        self.name = ""
         self._icon = Gtk.Image(icon_name="phone-symbolic", pixel_size=32)
         self.add_prefix(self._icon)
         self.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
         self.connect("activated", lambda _row: on_activate(self))
 
     def update(self, info):
-        self.seen = time.monotonic()
-        if info.get("name"):
-            self.name = info["name"]
-        if info.get("rssi") is not None:
-            self.rssi = info["rssi"]
-        model = (info.get("model") or self.name or "").lower()
-        if "mac" in model:
+        self.name = info.get("name") or self.name
+        if "mac" in (info.get("model") or self.name).lower():
             self._icon.set_from_icon_name("computer-symbolic")
-        self.set_title(GLib.markup_escape_text(self.name or ""))
-        self.set_subtitle(proximity(self.rssi))
+        self.set_title(GLib.markup_escape_text(self.name))
+        self.set_subtitle(proximity(info.get("rssi")))
 
 
 class SendWindow(Adw.ApplicationWindow):
@@ -239,6 +138,7 @@ class SendWindow(Adw.ApplicationWindow):
         self.files, self.urls = files, urls
         self.rows = {}
         self.sending = False
+        self.done = False
 
         header = Adw.HeaderBar()
         header.set_title_widget(Adw.WindowTitle(title="AirDrop", subtitle=summary(files, urls)))
@@ -274,10 +174,9 @@ class SendWindow(Adw.ApplicationWindow):
         view.add_top_bar(self.banner)
         self.set_content(view)
 
-        self.radio = Radio(self._on_up, self._on_failed, self._on_device)
-        self.connect("close-request", self._on_close)
-        GLib.timeout_add_seconds(DISCOVER_EVERY, self._prune)
-        self.radio.start()
+        self.airdrop = AirDrop(self._on_radio, self._on_failed, self._on_device, self._on_lost)
+        self.connect("close-request", lambda _w: self.airdrop.stop() or False)
+        self.airdrop.start()
 
     @staticmethod
     def _status(title, spinner=False, child=None):
@@ -288,31 +187,30 @@ class SendWindow(Adw.ApplicationWindow):
             page.set_child(child)
         return page
 
-    def _on_up(self):
-        self.stack.set_visible_child_name("list")
+    def _on_radio(self, state):
+        if state == "up" and self.stack.get_visible_child_name() == "starting":
+            self.stack.set_visible_child_name("list")
+        elif state == "idle" and self.done:
+            self.banner.set_title("Wi-Fi rétabli.")
 
     def _on_failed(self, reason):
-        if self.sending:
-            return
-        self._show_result("Impossible de démarrer AirDrop", reason, "dialog-error-symbolic")
+        if not self.done:
+            self._show_result("Impossible de démarrer AirDrop", reason, "dialog-error-symbolic")
 
     def _on_device(self, mac, info):
+        if self.done:
+            return
+        if self.stack.get_visible_child_name() == "starting":
+            self.stack.set_visible_child_name("list")
         row = self.rows.get(mac)
         if row is None:
-            if not info.get("name"):
-                return  # n'apparaît que celui qui accepte et a donné son nom
-            row = DeviceRow(mac, self._on_pick)
-            self.rows[mac] = row
+            row = self.rows[mac] = DeviceRow(mac, self._on_pick)
             self.list.append(row)
         row.update(info)
 
-    def _prune(self):
-        now = time.monotonic()
-        for mac, row in list(self.rows.items()):
-            if now - row.seen > FORGET_SECONDS:
-                self.list.remove(row)
-                del self.rows[mac]
-        return GLib.SOURCE_CONTINUE
+    def _on_lost(self, mac):
+        if row := self.rows.pop(mac, None):
+            self.list.remove(row)
 
     def _on_pick(self, row):
         if self.sending:
@@ -323,36 +221,32 @@ class SendWindow(Adw.ApplicationWindow):
         self.sending_page.set_description("En attente d'acceptation sur l'appareil…")
         self.progress.set_visible(False)
         self.stack.set_visible_child_name("sending")
-        self.radio.send(row.mac, self.files, self.urls, self._on_send_event)
+        self.airdrop.send(row.mac, self.files, self.urls, self._on_send_event)
 
-    def _on_send_event(self, kind, *args):
-        if kind == "accepted":
+    def _on_send_event(self, state, sent, total, detail):
+        if state == "accepted":
             self.sending_page.set_description("Envoi en cours…")
-        elif kind == "progress":
-            sent, total = args
+        elif state == "progress":
+            self.sending_page.set_description("Envoi en cours…")
             self.progress.set_visible(True)
             self.progress.set_fraction(sent / total if total else 1)
             self.progress.set_text(f"{GLib.format_size(sent)} / {GLib.format_size(total)}")
-        elif kind == "delivered":
+        elif state == "delivered":
             self._show_result("Envoyé", f"Reçu par {self.target}.", "object-select-symbolic")
             GLib.timeout_add_seconds(CLOSE_AFTER_SENT, self.close)
-        elif kind == "declined":
+        elif state == "declined":
             self._show_result("Refusé", f"{self.target} a refusé.", "action-unavailable-symbolic")
-        elif kind == "failed":
-            self._show_result("Échec de l'envoi", args[0], "dialog-error-symbolic")
+        elif state == "failed":
+            self._show_result("Échec de l'envoi", detail, "dialog-error-symbolic")
 
     def _show_result(self, title, description, icon):
+        self.done = True
         self.result_page.set_title(title)
         self.result_page.set_description(GLib.markup_escape_text(description))
         self.result_page.set_icon_name(icon)
         self.stack.set_visible_child_name("result")
-        # Fini : on rend le Wi-Fi tout de suite, sans attendre la fermeture.
-        threading.Thread(target=self.radio.stop, daemon=True).start()
-        self.banner.set_title("Wi-Fi rétabli.")
-
-    def _on_close(self, _window):
-        self.radio.stop()
-        return False
+        # Fini : airdropd rend la radio, sauf si une réception la tient encore.
+        self.airdrop.stop()
 
 
 class App(Adw.Application):

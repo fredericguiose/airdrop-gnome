@@ -77,37 +77,58 @@ nouvelle extension qu'à l'ouverture de session).
 
 ## Comment ça marche
 
+```
+ bouton GNOME Shell ─┐                       ┌─ owly receive / browse / send
+ fenêtre d'envoi ────┼─ D-Bus (session) ─ airdropd ─┤
+ (extension Chrome) ─┘   fr.portalstudio.AirDrop     └─ owlyd (D-Bus système) : la radio
+```
+
+Tout passe par **`airdropd`**, un petit service de session lancé par D-Bus au
+premier appel et qui s'arrête seul, inoccupé. Il tient le bail radio d'owlyd
+**pour tous** : owlyd n'en prête qu'un à la fois, et la réception comme
+l'envoi savent partager celui qui est levé. La radio monte pour le premier
+utilisateur et redescend avec le dernier ; owlyd la reprend si le service meurt.
+
 | Composant | Rôle |
 |---|---|
-| `extension/` | Extension GNOME Shell 50 : bouton, notifications. Lance `owly radio up` et `owly receive`, répond à leur « accept? » |
-| `send/airdrop-send` | Fenêtre d'envoi (Python, GTK 4, libadwaita). `owly browse` réveille les iPhone en Bluetooth ; `send/discover.py` demande leur nom aux pairs AWDL (`POST /Discover`), ce que la CLI d'Owly ne fait pas sans envoyer |
+| `airdrop/daemon.py` (`bin/airdropd`) | Le service : radio partagée, réception (demande → `Answer`), recherche des appareils, envoi avec progression |
+| `airdrop/owly.py` | Toute la lecture de la sortie de la CLI d'Owly, en un seul endroit |
+| `airdrop/discover.py` | Demande leur nom aux pairs AWDL (`POST /Discover`), ce que la CLI d'Owly ne fait pas sans envoyer ; `owly browse` réveille les iPhone en Bluetooth |
+| `extension/` | Extension GNOME Shell 50 : le bouton et les notifications, simple client D-Bus (aucun processus dans le Shell) |
+| `send/airdrop-send` | Fenêtre d'envoi (Python, GTK 4, libadwaita), cliente du service |
 | `nautilus/` | Entrée « Envoyer via AirDrop » du clic droit (nautilus-python) |
 | `driver/` | Le patch mt76 et son installation DKMS |
 | `owly-config/` | Installation et configuration d'Owly |
 
-**Version d'Owly** : testé avec **0.4.1**. L'extension et la fenêtre d'envoi
-lisent la sortie texte de la CLI d'Owly (`wants to send:`, `accept? [y/N]`,
-`delivered`…) : une autre version peut la changer.
+L'interface D-Bus est décrite en tête de `airdrop/daemon.py` : `StartReceiving`,
+`Answer`, `StartBrowsing`, `GetDevices`, `Send`… et les signaux `Request`,
+`Received`, `DeviceSeen`, `SendProgress`…
+
+**Version d'Owly** : testé avec **0.4.1**. Le service lit la sortie texte de
+la CLI d'Owly (`wants to send:`, `accept? [y/N]`, `delivered`…) : une autre
+version peut la changer, et `airdrop/owly.py` est le seul fichier à adapter.
 
 ## Tests
 
 ```sh
+sudo dnf install dbus-daemon   # pour dbus-run-session
 tests/run.sh
 ```
 
-Aucun test ne touche au Wi-Fi : `tests/fake-owly/owly` imite la CLI. Le
-dernier ouvre la fenêtre d'envoi et la pilote jusqu'à « Envoyé ».
+Aucun test ne touche au Wi-Fi : `tests/fake-owly/owly` imite la CLI,
+`tests/fake-owlyd.py` imite owlyd sur un bus D-Bus privé. On y vérifie
+notamment que réception et envoi simultanés ne demandent **qu'une** radio, et
+qu'elle est rendue. Le dernier test ouvre la fenêtre d'envoi et la pilote
+jusqu'à « Envoyé ».
 
 ## Limites connues et suite
 
-- La réception (dans GNOME Shell) et l'envoi (dans la fenêtre) tiennent chacun
-  leur radio : owlyd n'en prête qu'une à la fois, donc pas d'envoi pendant une
-  réception. Prévu : un service de session `airdropd` qui partage la radio, et
-  dont le bouton, la fenêtre et une extension Chrome seraient les clients.
 - Pas encore de choix automatique du mode partagé (Wi-Fi gardé) quand le
   réseau est sur 6, 44 ou 149.
-- `send/discover.py` refait le `POST /Discover` d'owly-airdrop, que la CLI
-  n'expose pas seul ; à retirer si `owly browse` interroge un jour les pairs AWDL.
+- Envoi lent (~100 Ko/s) quand l'iPhone est sur un Wi-Fi 2,4 GHz : voir
+  l'[issue #1](https://github.com/fredericguiose/airdrop-gnome/issues/1).
+- `airdrop/discover.py` refait le `POST /Discover` d'owly-airdrop ; à retirer
+  si `owly browse` interroge un jour les pairs AWDL.
 
 ## Crédits
 

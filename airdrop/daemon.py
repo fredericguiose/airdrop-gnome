@@ -12,6 +12,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -85,13 +86,19 @@ XML = f"""
 """
 
 
+def log(*args):
+    """Sur stderr : le journal de l'unité systemd que D-Bus crée pour nous
+    (journalctl --user -u 'dbus-*fr.portalstudio.AirDrop*')."""
+    print("airdropd:", *args, file=sys.stderr, flush=True)
+
+
 def spawn(args, **kw):
-    # Le processus fils suit airdropd dans la tombe : sans lui, plus personne
-    # ne lirait ses tuyaux.
-    def die_with_parent():
-        import ctypes
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGINT)  # PR_SET_PDEATHSIG
-    return subprocess.Popen(args, preexec_fn=die_with_parent, **kw)
+    # Pas de preexec_fn : airdropd a des threads, et du code Python entre
+    # fork et exec peut bloquer le fils avant même qu'owly démarre. Les
+    # processus owly sont arrêtés par interrupt() ; si airdropd meurt, owlyd
+    # reprend la radio et awdl0 disparaît sous eux.
+    log("lance", " ".join(args))
+    return subprocess.Popen(args, **kw)
 
 
 def interrupt(proc):
@@ -165,6 +172,7 @@ class Radio:
             self.users.clear()
             self._set("idle")
             reason = Gio.DBusError.strip_remote_error(e) or e.message
+            log("Acquire refusé :", reason)
             for callback in waiting:
                 callback(reason)
             return
@@ -191,6 +199,7 @@ class Radio:
     def _owly_state(self, _conn, _sender, _path, _iface, _signal, params):
         lease, state, _reason = params.unpack()
         if lease == self.lease and state != "up":
+            log(f"owlyd a fini le bail {lease} ({state}, {_reason})")
             self.lease = None
             self.users.clear()
             self._set("idle")
@@ -198,6 +207,7 @@ class Radio:
 
     def _set(self, state):
         if state != self.state:
+            log("radio", self.state, "→", state, "pour", sorted(self.users) or "personne")
             self.state = state
             self._on_state(state)
 
@@ -271,7 +281,8 @@ class Service:
 
     # --- Réception ---------------------------------------------------------
 
-    def _m_StartReceiving(self, _sender, seconds):
+    def _m_StartReceiving(self, sender, seconds):
+        log("StartReceiving", seconds, "s, demandé par", sender)
         self._set_deadline(seconds)
         if self.receiver is None and "receive" not in self.radio.users:
             self.radio.acquire("receive", self._receive_ready)
@@ -281,7 +292,9 @@ class Service:
         self._stop_receiving("stopped")
         return None
 
-    def _m_Answer(self, _sender, request, accept):
+    def _m_Answer(self, sender, request, accept):
+        log("Answer", request, "accepte" if accept else "refuse", "de", sender,
+            "(en attente :", self.pending, ")")
         if self.pending and self.pending == request and self.receiver:
             self.pending = None
             self._write_receiver(b"y\n" if accept else b"n\n")
@@ -314,6 +327,7 @@ class Service:
         proc = self.receiver
 
         def on_err(line):
+            log("receive:", line)
             if proc is self.receiver:
                 self._receive_event(parser.line(line))
 
@@ -325,6 +339,7 @@ class Service:
             return event is not None
 
         def on_out(line):
+            log("receive (stdout):", line)
             if proc is self.receiver:
                 self._receive_event(owly.parse_received(line))
 
@@ -374,6 +389,7 @@ class Service:
             pass
 
     def _receiver_exited(self, proc):
+        log("owly receive a quitté, code", proc.returncode)
         if proc is self.receiver:
             self._stop_receiving("stopped")
 

@@ -5,6 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 python3 -m unittest -v tests/test_owly.py tests/test_native_host.py
+gjs -m tests/test_extension.js
 dbus-run-session -- python3 tests/test_daemon.py
 # GTK et les portails sont bavards sur un bus vide : on ne garde que le verdict.
 out="$(dbus-run-session -- python3 tests/test_send_ui.py 2>&1)" && status=0 || status=$?

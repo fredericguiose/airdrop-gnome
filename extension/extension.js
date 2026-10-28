@@ -11,6 +11,8 @@ import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
+import {describe, parseRequest, unpackSignal} from './request.js';
+
 const ICON = 'network-wireless-hotspot-symbolic';
 const DURATIONS = [2, 5, 10];
 const DEFAULT_MINUTES = 5;
@@ -18,16 +20,6 @@ const DEFAULT_MINUTES = 5;
 const BUS_NAME = 'fr.portalstudio.AirDrop';
 const PATH = '/fr/portalstudio/AirDrop';
 const IFACE = 'fr.portalstudio.AirDrop1';
-
-function describe(files, urls) {
-    if (urls.length)
-        return urls.join('\n');
-    const total = files.reduce((n, f) => n + f.size, 0);
-    const size = GLib.format_size(total);
-    if (files.length === 1)
-        return `${files[0].name} (${size})`;
-    return `${files.length} fichiers (${size})`;
-}
 
 const AirDropToggle = GObject.registerClass(
 class AirDropToggle extends QuickMenuToggle {
@@ -95,10 +87,14 @@ class AirDropIndicator extends SystemIndicator {
                         console.error(`AirDrop: ${e.message}`);
                     return;
                 }
-                this._proxy.connect('g-signal', (_p, _sender, name, params) =>
-                    this._onSignal(name, params.deepUnpack()));
-                this._proxy.connect('g-properties-changed', () => this._sync());
-                this._proxy.connect('notify::g-name-owner', () => this._sync());
+                // Débranchés dans destroy() : GNOME détruit l'extension au
+                // verrouillage de l'écran, le proxy, lui, continuerait.
+                this._proxyIds = [
+                    this._proxy.connect('g-signal', (_p, _sender, name, params) =>
+                        this._onSignal(name, unpackSignal(params))),
+                    this._proxy.connect('g-properties-changed', () => this._sync()),
+                    this._proxy.connect('notify::g-name-owner', () => this._sync()),
+                ];
                 this._sync();
             });
     }
@@ -186,8 +182,7 @@ class AirDropIndicator extends SystemIndicator {
     _onSignal(name, args) {
         switch (name) {
         case 'Request': {
-            const [id, sender, files, urls] = args;
-            this._onRequest(id, sender, files.map(f => ({name: f.name, size: Number(f.size)})), urls);
+            this._onRequest(parseRequest(args));
             break;
         }
         case 'RequestClosed': {
@@ -219,8 +214,9 @@ class AirDropIndicator extends SystemIndicator {
         }
     }
 
-    _onRequest(id, sender, files, urls) {
-        const n = this._notify(`${sender} veut vous envoyer`, describe(files, urls), {
+    _onRequest(request) {
+        const {id, sender} = request;
+        const n = this._notify(`${sender} veut vous envoyer`, describe(request), {
             urgency: MessageTray.Urgency.CRITICAL,
             resident: true,
         });
@@ -291,6 +287,9 @@ class AirDropIndicator extends SystemIndicator {
     destroy() {
         this._destroying = true;
         this._cancellable.cancel();
+        for (const id of this._proxyIds ?? [])
+            this._proxy.disconnect(id);
+        this._proxy = null;
         this._clearTimer();
         for (const n of this._requests.values())
             n.destroy();

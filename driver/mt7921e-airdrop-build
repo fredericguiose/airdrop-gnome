@@ -20,6 +20,22 @@ RAW="https://raw.githubusercontent.com/gregkh/linux/v$UPSTREAM/$MT76"
 
 log() { echo "$NAME: $*"; logger -t "$NAME" -- "$*" 2>/dev/null || true; }
 
+# Si le noyau qui tourne a encore le pilote d'origine (cas du premier démarrage
+# après une mise à jour, quand le module est construit ici, après le chargement
+# du pilote), le recharger : coupe le Wi-Fi ~5 s. Le module patché est
+# hors arbre, donc marqué « O » dans /sys/module/mt7921e/taint.
+reload_if_needed() {
+  [ "$KVER" = "$(uname -r)" ] || return 0
+  [ -d /sys/module/mt7921e ] || return 0
+  grep -q O /sys/module/mt7921e/taint 2>/dev/null && return 0
+  if modprobe -r mt7921e && modprobe mt7921e; then
+    systemctl try-restart owlyd 2>/dev/null || true
+    log "pilote rechargé : version patchée active"
+  else
+    log "rechargement du pilote impossible, actif au prochain démarrage"
+  fi
+}
+
 if [ ! -d "/lib/modules/$KVER/build" ]; then
   log "pas de kernel-devel pour $KVER, rien à faire (pilote d'origine conservé)"
   exit 0
@@ -27,6 +43,7 @@ fi
 
 if dkms status -m "$NAME" -v "$UPSTREAM" -k "$KVER" 2>/dev/null | grep -q installed; then
   log "déjà installé pour $KVER"
+  reload_if_needed
   exit 0
 fi
 
@@ -68,7 +85,8 @@ fi
 dkms add -m "$NAME" -v "$UPSTREAM" 2>/dev/null || true
 dkms build -m "$NAME" -v "$UPSTREAM" -k "$KVER"
 dkms install -m "$NAME" -v "$UPSTREAM" -k "$KVER"
-log "installé pour $KVER (actif au prochain chargement du pilote)"
+log "installé pour $KVER"
+reload_if_needed
 
 # Les versions dont plus aucun noyau installé n'a besoin.
 for v in $(dkms status -m "$NAME" 2>/dev/null | sed -n "s|^$NAME/\([^,:]*\).*|\1|p" | sort -u); do
